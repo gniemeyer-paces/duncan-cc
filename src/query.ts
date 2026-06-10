@@ -53,6 +53,21 @@ function readFromKeychain(service: string): string | null {
   }
 }
 
+/**
+ * Check if an OAuth credentials blob has an unexpired accessToken.
+ * CC's expiresAt field is unix-ms; missing / unparseable values are treated
+ * as "not expired" (the API will reject if actually stale — better than
+ * silently skipping a blob CC might still consider valid).
+ */
+function oauthIsFresh(creds: any): boolean {
+  const exp = creds?.claudeAiOauth?.expiresAt;
+  if (typeof exp !== "number") return true;
+  // Heuristic: a second-precision epoch < 10^12, ms-precision >= 10^12.
+  const expMs = exp < 1e12 ? exp * 1000 : exp;
+  // 60s skew buffer — don't hand back a token that's about to expire.
+  return expMs > Date.now() + 60_000;
+}
+
 function resolveAuth(explicit?: string): ResolvedAuth {
   if (explicit) {
     if (explicit.includes("sk-ant-oat")) {
@@ -61,33 +76,44 @@ function resolveAuth(explicit?: string): ResolvedAuth {
     return { apiKey: explicit };
   }
 
-  // CC's OAuth from credentials file — primary auth for CC users
+  // Collect OAuth candidates (file + keychain) and pick the freshest unexpired
+  // one. CC can end up with both — keychain as primary, file as legacy — and
+  // they drift independently. Preferring the file unconditionally (as we used
+  // to) breaks when the file token has expired but keychain has a fresh one.
+  const candidates: Array<{ source: string; creds: any; token: string }> = [];
+
   const ccCredsPath = join(homedir(), ".claude", ".credentials.json");
   if (existsSync(ccCredsPath)) {
     try {
       const creds = JSON.parse(readFileSync(ccCredsPath, "utf-8"));
-      if (creds.claudeAiOauth?.accessToken) {
-        return oauthClientConfig(creds.claudeAiOauth.accessToken);
+      const token = creds?.claudeAiOauth?.accessToken;
+      if (typeof token === "string" && token) {
+        candidates.push({ source: "file", creds, token });
       }
     } catch {}
   }
 
-  // macOS keychain — CC may store OAuth tokens here instead of / in addition to the file
   const keychainToken = readFromKeychain("Claude Code-credentials");
   if (keychainToken) {
-    // Keychain may store the full JSON or just the token
     try {
-      const parsed = JSON.parse(keychainToken);
-      if (parsed.claudeAiOauth?.accessToken) {
-        return oauthClientConfig(parsed.claudeAiOauth.accessToken);
+      const creds = JSON.parse(keychainToken);
+      const token = creds?.claudeAiOauth?.accessToken;
+      if (typeof token === "string" && token) {
+        candidates.push({ source: "keychain", creds, token });
       }
     } catch {
-      // Not JSON — treat as raw token
+      // Not JSON — treat as raw token, no expiry info available
       if (keychainToken.startsWith("sk-ant-")) {
-        return oauthClientConfig(keychainToken);
+        candidates.push({ source: "keychain-raw", creds: null, token: keychainToken });
       }
     }
   }
+
+  // Prefer fresh candidates; fall back to any candidate if all look stale (the
+  // API call will surface the real error in that case, but at least we tried).
+  const fresh = candidates.find((c) => oauthIsFresh(c.creds));
+  const chosen = fresh ?? candidates[0];
+  if (chosen) return oauthClientConfig(chosen.token);
 
   // Fallback: API key from environment
   if (process.env.ANTHROPIC_API_KEY) return { apiKey: process.env.ANTHROPIC_API_KEY };

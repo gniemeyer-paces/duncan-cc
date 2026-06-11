@@ -1,8 +1,8 @@
 /**
  * Duncan Query Dispatch
  * 
- * Queries CC sessions using the Anthropic API with structured output
- * via the duncan_response tool.
+ * Queries CC sessions using the Anthropic API with structured outputs
+ * (output_config.format) constrained to the duncan response schema.
  */
 
 import Anthropic from "@anthropic-ai/sdk";
@@ -53,6 +53,21 @@ function readFromKeychain(service: string): string | null {
   }
 }
 
+/**
+ * Check if an OAuth credentials blob has an unexpired accessToken.
+ * CC's expiresAt field is unix-ms; missing / unparseable values are treated
+ * as "not expired" (the API will reject if actually stale — better than
+ * silently skipping a blob CC might still consider valid).
+ */
+function oauthIsFresh(creds: any): boolean {
+  const exp = creds?.claudeAiOauth?.expiresAt;
+  if (typeof exp !== "number") return true;
+  // Heuristic: a second-precision epoch < 10^12, ms-precision >= 10^12.
+  const expMs = exp < 1e12 ? exp * 1000 : exp;
+  // 60s skew buffer — don't hand back a token that's about to expire.
+  return expMs > Date.now() + 60_000;
+}
+
 function resolveAuth(explicit?: string): ResolvedAuth {
   if (explicit) {
     if (explicit.includes("sk-ant-oat")) {
@@ -61,33 +76,44 @@ function resolveAuth(explicit?: string): ResolvedAuth {
     return { apiKey: explicit };
   }
 
-  // CC's OAuth from credentials file — primary auth for CC users
+  // Collect OAuth candidates (file + keychain) and pick the freshest unexpired
+  // one. CC can end up with both — keychain as primary, file as legacy — and
+  // they drift independently. Preferring the file unconditionally (as we used
+  // to) breaks when the file token has expired but keychain has a fresh one.
+  const candidates: Array<{ source: string; creds: any; token: string }> = [];
+
   const ccCredsPath = join(homedir(), ".claude", ".credentials.json");
   if (existsSync(ccCredsPath)) {
     try {
       const creds = JSON.parse(readFileSync(ccCredsPath, "utf-8"));
-      if (creds.claudeAiOauth?.accessToken) {
-        return oauthClientConfig(creds.claudeAiOauth.accessToken);
+      const token = creds?.claudeAiOauth?.accessToken;
+      if (typeof token === "string" && token) {
+        candidates.push({ source: "file", creds, token });
       }
     } catch {}
   }
 
-  // macOS keychain — CC may store OAuth tokens here instead of / in addition to the file
   const keychainToken = readFromKeychain("Claude Code-credentials");
   if (keychainToken) {
-    // Keychain may store the full JSON or just the token
     try {
-      const parsed = JSON.parse(keychainToken);
-      if (parsed.claudeAiOauth?.accessToken) {
-        return oauthClientConfig(parsed.claudeAiOauth.accessToken);
+      const creds = JSON.parse(keychainToken);
+      const token = creds?.claudeAiOauth?.accessToken;
+      if (typeof token === "string" && token) {
+        candidates.push({ source: "keychain", creds, token });
       }
     } catch {
-      // Not JSON — treat as raw token
+      // Not JSON — treat as raw token, no expiry info available
       if (keychainToken.startsWith("sk-ant-")) {
-        return oauthClientConfig(keychainToken);
+        candidates.push({ source: "keychain-raw", creds: null, token: keychainToken });
       }
     }
   }
+
+  // Prefer fresh candidates; fall back to any candidate if all look stale (the
+  // API call will surface the real error in that case, but at least we tried).
+  const fresh = candidates.find((c) => oauthIsFresh(c.creds));
+  const chosen = fresh ?? candidates[0];
+  if (chosen) return oauthClientConfig(chosen.token);
 
   // Fallback: API key from environment
   if (process.env.ANTHROPIC_API_KEY) return { apiKey: process.env.ANTHROPIC_API_KEY };
@@ -110,29 +136,30 @@ function oauthClientConfig(token: string): ResolvedAuth {
 }
 
 // ============================================================================
-// Duncan Response Tool
+// Duncan Response Schema (structured outputs)
 // ============================================================================
 
-const DUNCAN_RESPONSE_TOOL: Anthropic.Tool = {
-  name: "duncan_response",
-  description: "Provide your answer to the query.",
-  input_schema: {
-    type: "object" as const,
-    properties: {
-      hasContext: {
-        type: "boolean",
-        description: "true if the conversation contained specific information to answer the question, false if it did not",
-      },
-      answer: {
-        type: "string",
-        description: "Your answer based on the conversation context, or a brief explanation of why you lack context",
-      },
+// Constrains the response via output_config.format so hasContext/answer are
+// always present and correctly typed — a forced tool_choice does not enforce
+// required fields (the model can omit hasContext), which forced a retry that
+// then 400'd. additionalProperties:false is required by structured outputs.
+const DUNCAN_SCHEMA = {
+  type: "object" as const,
+  properties: {
+    hasContext: {
+      type: "boolean",
+      description: "true if the conversation contained specific information to answer the question, false if it did not",
     },
-    required: ["hasContext", "answer"],
+    answer: {
+      type: "string",
+      description: "Your answer based on the conversation context, or a brief explanation of why you lack context",
+    },
   },
+  required: ["hasContext", "answer"],
+  additionalProperties: false,
 };
 
-const DUNCAN_PREFIX = `Answer solely based on the conversation above. If you don't explicitly have context from the conversation on this topic, say so. Use the duncan_response tool to provide your answer.
+const DUNCAN_PREFIX = `Answer solely based on the conversation above. If you don't explicitly have context from the conversation on this topic, set hasContext to false and say so in answer.
 
 `;
 
@@ -245,74 +272,52 @@ export async function querySingleWindow(
 
   const startTime = Date.now();
 
-  // Use .stream() instead of .create() to avoid SDK timeout warnings
-  // on large contexts with high max_tokens. Accumulate via finalMessage().
+  // Use .stream() instead of .create() to avoid SDK timeout warnings on large
+  // contexts with high max_tokens. Accumulate via finalMessage(). Structured
+  // outputs (output_config.format) constrains the reply to DUNCAN_SCHEMA, so
+  // hasContext/answer are guaranteed present — no tool_choice, no retry loop.
+  // output_config is passed through verbatim (SDK 0.52 predates its typings).
   const stream = client.messages.stream({
     model,
     system: systemBlocks.length > 0 ? systemBlocks : undefined,
     messages: fixedMessages,
-    tools: [DUNCAN_RESPONSE_TOOL],
-    tool_choice: { type: "tool" as const, name: "duncan_response" },
+    output_config: { format: { type: "json_schema", schema: DUNCAN_SCHEMA } },
     max_tokens: 64000,
-  });
+  } as any);
   const response = await stream.finalMessage();
+  const latencyMs = Date.now() - startTime;
 
-  // With tool_choice forced, the response must contain the tool call
-  const toolCall = response.content.find(
-    (c): c is Anthropic.ToolUseBlock => c.type === "tool_use" && c.name === "duncan_response",
-  );
-
-  if (toolCall) {
-    const input = toolCall.input as Record<string, unknown>;
-    const parsed = coerceDuncanResponse(input);
-    if (parsed) {
-      const latencyMs = Date.now() - startTime;
-      return { ...parsed, usage: response.usage as any, latencyMs };
-    }
-
-    // Malformed input — retry up to 3 times with correction prompt
-    let retryMessages: Anthropic.MessageParam[] = [
-      ...fixedMessages,
-      { role: "assistant" as const, content: response.content },
-      {
-        role: "user" as const,
-        content: "Your duncan_response tool call had invalid input. Call it again with { hasContext: boolean, answer: string }.",
-      },
-    ];
-
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const retryStream = client.messages.stream({
-        model,
-        system: systemBlocks.length > 0 ? systemBlocks : undefined,
-        messages: retryMessages,
-        tools: [DUNCAN_RESPONSE_TOOL],
-        tool_choice: { type: "tool" as const, name: "duncan_response" },
-        max_tokens: 64000,
-      });
-      const retryResponse = await retryStream.finalMessage();
-      const retryCall = retryResponse.content.find(
-        (c): c is Anthropic.ToolUseBlock => c.type === "tool_use" && c.name === "duncan_response",
-      );
-      if (retryCall) {
-        const retryParsed = coerceDuncanResponse(retryCall.input as Record<string, unknown>);
-        if (retryParsed) {
-          const latencyMs = Date.now() - startTime;
-          return { ...retryParsed, usage: retryResponse.usage as any, latencyMs };
-        }
-      }
-      // Append failed attempt for next retry
-      retryMessages = [
-        ...retryMessages,
-        { role: "assistant" as const, content: retryResponse.content },
-        {
-          role: "user" as const,
-          content: "Still invalid. Call duncan_response with { hasContext: boolean, answer: string }.",
-        },
-      ];
-    }
+  if (response.stop_reason === "refusal") {
+    return {
+      hasContext: false,
+      answer: "[The model declined to answer this query.]",
+      usage: response.usage as any,
+      latencyMs,
+    };
   }
 
-  throw new Error("Duncan query failed: model did not produce a valid duncan_response tool call after 3 retries");
+  // Structured output lands as JSON in the text block(s).
+  const text = response.content
+    .filter((c): c is Anthropic.TextBlock => c.type === "text")
+    .map((c) => c.text)
+    .join("");
+
+  let parsedJson: unknown;
+  try {
+    parsedJson = JSON.parse(text);
+  } catch {
+    // Schema-valid JSON is guaranteed unless the response was cut off
+    // (e.g. stop_reason "max_tokens"). Surface it rather than silently failing.
+    throw new Error(
+      `Duncan query failed: structured output was not valid JSON (stop_reason=${response.stop_reason}, length=${text.length})`,
+    );
+  }
+
+  const parsed = coerceDuncanResponse(parsedJson as Record<string, unknown>);
+  if (!parsed) {
+    throw new Error("Duncan query failed: structured output missing hasContext/answer");
+  }
+  return { ...parsed, usage: response.usage as any, latencyMs };
 }
 
 // ============================================================================
@@ -837,8 +842,8 @@ export async function querySubagents(
  * of each message gets cache_control when caching is enabled.
  */
 /**
- * Coerce a duncan_response tool input to the expected shape.
- * Handles common model quirks: hasContext as string, missing fields.
+ * Coerce a parsed duncan response to the expected shape.
+ * Handles residual quirks: hasContext as string, missing fields.
  */
 /** Aggregate usage stats from all results in a batch. */
 function aggregateUsage(results: DuncanQueryResult[]): DuncanUsageStats {

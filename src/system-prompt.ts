@@ -11,6 +11,7 @@
  * Dynamic sections: environment info, CLAUDE.md, memory, language
  */
 
+import { randomUUID } from "node:crypto";
 import { readFileSync, existsSync, readdirSync, statSync } from "node:fs";
 import { join, dirname, resolve, parse as parsePath } from "node:path";
 import { platform, release } from "node:os";
@@ -400,7 +401,7 @@ export function injectUserContext(
   return [
     {
       type: "user",
-      uuid: crypto.randomUUID(),
+      uuid: randomUUID(),
       parentUuid: null,
       timestamp: new Date().toISOString(),
       isMeta: true,

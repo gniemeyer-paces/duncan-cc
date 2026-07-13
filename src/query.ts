@@ -205,6 +205,8 @@ export interface DuncanBatchResult {
   offset: number;
   /** Aggregated token usage across all queries in this batch */
   usage: DuncanUsageStats;
+  /** Sessions that resolved but failed window processing (path + error) */
+  unprocessable?: Array<{ sessionId: string; error: string }>;
 }
 
 // ============================================================================
@@ -382,6 +384,7 @@ export async function queryBatch(
       hasMore: false,
       offset: routing.offset ?? 0,
       usage: emptyUsage,
+      unprocessable: [],
     };
   }
 
@@ -398,6 +401,7 @@ export async function queryBatch(
     pipeline: WindowPipelineResult;
     windowType: "main" | "compaction";
   }> = [];
+  const unprocessable: Array<{ sessionId: string; error: string }> = [];
 
   for (const session of resolved.sessions) {
     try {
@@ -423,8 +427,10 @@ export async function queryBatch(
           windowType,
         });
       }
-    } catch {
-      // Skip unprocessable sessions
+    } catch (err: any) {
+      // surface instead of silently skipping: a resolved-but-unprocessable session
+      // otherwise reads as "no sessions found", destroying the evidence
+      unprocessable.push({ sessionId: session.sessionId, error: String(err?.message ?? err) });
     }
   }
 
@@ -485,6 +491,7 @@ export async function queryBatch(
     hasMore: resolved.hasMore,
     offset: routing.offset ?? 0,
     usage: aggregateUsage(results),
+    unprocessable,
   };
   logBatchResults(batchResult, routing.mode, callingSessionId);
   return batchResult;

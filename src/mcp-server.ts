@@ -43,13 +43,22 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       description:
         "Query dormant Claude Code sessions to recall information from previous conversations. " +
         "Loads session context and asks the target session's model whether it has relevant information. " +
-        "Use when you need to find something discussed in a previous CC session.",
+        "Use when you need to find something discussed in a previous CC session. " +
+        "Treat answers as testimony, not ground truth: they mirror the question's framing (wrong premises get " +
+        "conceded), and quotes can be confabulated — corroborate load-bearing answers against the raw " +
+        "transcript or outputs. Reassembled context omits old TOOL RESULTS (microcompact replaces them with " +
+        "placeholders), so the session remembers what it wrote and the calls it made, not what tools returned " +
+        "— anchor questions in the session's own prose and written outputs, and treat 'no context' about " +
+        "tool-result contents (files read, fetches, grep hits) as an artifact, not evidence of absence.",
       inputSchema: {
         type: "object" as const,
         properties: {
           question: {
             type: "string",
-            description: "The question to ask previous sessions. Be specific and self-contained.",
+            description:
+              "The question to ask previous sessions. Be specific and self-contained, anchored in artifacts " +
+              "the session actually saw (its files, values, quotes) rather than external labels it never " +
+              "encountered.",
           },
           mode: {
             type: "string",
@@ -365,9 +374,12 @@ async function handleDuncanQuery(args: {
     );
 
     if (result.results.length === 0) {
-      return {
-        content: [{ type: "text", text: "No sessions found matching the routing criteria." }],
-      };
+      const broken = result.unprocessable ?? [];
+      const text = broken.length > 0
+        ? `${broken.length} session(s) matched the routing criteria but failed window processing:\n`
+          + broken.map((b) => `- ${b.sessionId}: ${b.error}`).join("\n")
+        : "No sessions found matching the routing criteria.";
+      return { content: [{ type: "text", text }] };
     }
 
     const errors = result.results.filter((r) => r.result.answer.startsWith("Error: "));
@@ -482,7 +494,7 @@ async function handleListSessions(args: {
         ? `${(s.size / 1024 / 1024).toFixed(1)}MB`
         : `${(s.size / 1024).toFixed(0)}KB`;
 
-      let line = `**${s.sessionId.slice(0, 12)}**  ${date}  ${size}`;
+      let line = `**${s.sessionId}**  ${date}  ${size}`;
 
       if (showPreviews) {
         const preview = extractSessionPreview(s.path, previewLines);

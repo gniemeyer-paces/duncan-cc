@@ -62,6 +62,21 @@ export function getProjectDir(cwd: string): string | null {
   return null;
 }
 
+/**
+ * Resolve a user-supplied projectDir to an on-disk project directory.
+ * Accepts the hashed path under ~/.claude/projects, a bare hashed dir name,
+ * an original cwd, or the lossy decoded cwd from duncan_projects — CC's
+ * sanitization maps every non-alphanumeric char to '-', so re-encoding a
+ * decoded path recovers the original dir name.
+ */
+export function resolveProjectDirInput(input: string): string | null {
+  const projectsDir = getProjectsDir();
+  if (input.startsWith(projectsDir) && existsSync(input)) return input;
+  const encoded = join(projectsDir, cwdToProjectDirName(input));
+  if (existsSync(encoded)) return encoded;
+  return existsSync(input) ? input : null;
+}
+
 // ============================================================================
 // Session file discovery
 // ============================================================================
@@ -455,7 +470,9 @@ export function resolveSessionFiles(params: RoutingParams): RoutingResult {
 
   switch (params.mode) {
     case "project": {
-      const projectDir = params.projectDir ?? (params.cwd ? getProjectDir(params.cwd) : null);
+      const projectDir = params.projectDir
+        ? resolveProjectDirInput(params.projectDir)
+        : (params.cwd ? getProjectDir(params.cwd) : null);
       if (!projectDir) {
         return { sessions: [], totalCount: 0, hasMore: false };
       }
@@ -493,16 +510,22 @@ export function resolveSessionFiles(params: RoutingParams): RoutingResult {
           projectDir: dirname(params.sessionId),
         }];
       } else {
-        // Try to find by session ID across all projects
+        // Try to find by session ID across all projects (exact match, then id prefix —
+        // models routinely pass back truncated ids they saw in list output)
         const all = listAllSessionFiles();
         allSessions = all.filter((s) => s.sessionId === params.sessionId);
+        if (allSessions.length === 0) {
+          allSessions = all.filter((s) => s.sessionId.startsWith(params.sessionId!));
+        }
       }
       break;
     }
 
     case "branch": {
       // Find all sessions in the same project that share a git branch with the current session.
-      const projectDir = params.projectDir ?? (params.cwd ? getProjectDir(params.cwd) : null);
+      const projectDir = params.projectDir
+        ? resolveProjectDirInput(params.projectDir)
+        : (params.cwd ? getProjectDir(params.cwd) : null);
       if (!projectDir) {
         return { sessions: [], totalCount: 0, hasMore: false };
       }

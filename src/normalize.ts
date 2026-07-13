@@ -8,6 +8,7 @@
  * Pipeline: reorder-attachments → filter → type-switch → post-transforms (8 steps)
  */
 
+import { randomUUID } from "node:crypto";
 import type { CCMessage } from "./parser.js";
 import { isApiErrorMessage, isCompactBoundary, isLocalCommand } from "./parser.js";
 
@@ -19,7 +20,7 @@ import { isApiErrorMessage, isCompactBoundary, isLocalCommand } from "./parser.j
 function makeUserMessage(content: string | any[], opts: Partial<CCMessage> = {}): CCMessage {
   return {
     type: "user",
-    uuid: opts.uuid ?? crypto.randomUUID(),
+    uuid: opts.uuid ?? randomUUID(),
     parentUuid: null,
     timestamp: opts.timestamp ?? new Date().toISOString(),
     isMeta: opts.isMeta ?? true,
@@ -89,9 +90,33 @@ function isWhitespaceOnly(content: any[]): boolean {
 // semantic content without needing the full tool definitions.
 // ============================================================================
 
+// Ephemeral per-turn attachments CC regenerates fresh each turn and never
+// replays into API context (its normalizeAttachmentForAPI returns [] for these,
+// or re-derives only the current one). Rendering every stored copy — above all
+// task_reminder, which carries the entire task list each turn — inflated a
+// single window to >2M tokens and made it unqueryable. Mirror CC and drop them.
+// Source of truth: CC nullRenderingAttachments.ts NULL_RENDERING_TYPES (verified
+// against 2.1.206). Content-bearing attachments (file, directory,
+// plan_file_reference, invoked_skills, teammate_mailbox, selected_lines_in_ide,
+// pdf_reference, compact_file_reference) are NOT in this set and pass through.
+const NULL_RENDERING_ATTACHMENT_TYPES = new Set<string>([
+  "hook_success", "hook_additional_context", "hook_cancelled",
+  "command_permissions", "agent_mention", "budget_usd",
+  "critical_system_reminder", "edited_image_file", "edited_text_file",
+  "opened_file_in_ide", "output_style", "plan_mode", "plan_mode_exit",
+  "plan_mode_reentry", "structured_output", "team_context", "todo_reminder",
+  "context_efficiency", "deferred_tools_delta", "mcp_instructions_delta",
+  "companion_intro", "token_usage", "ultrathink_effort", "max_turns_reached",
+  "task_reminder", "auto_mode", "auto_mode_exit", "output_token_usage",
+  "pen_mode_enter", "pen_mode_exit", "verify_plan_reminder",
+  "current_session_memory", "compaction_reminder", "date_change",
+]);
+
 function convertAttachment(msg: CCMessage): CCMessage[] {
   const attachment = msg.attachment;
   if (!attachment) return [];
+
+  if (NULL_RENDERING_ATTACHMENT_TYPES.has(attachment.type)) return [];
 
   switch (attachment.type) {
     case "directory":
